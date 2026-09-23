@@ -115,48 +115,159 @@ function Utils.GetMobileJoinLink(placeId, jobId)
     return string.format("roblox://experiences/start?placeId=%s&gameInstanceId=%s", tostring(placeId), tostring(jobId))
 end
 
--- Mobile & PC Touch/Mouse Dragging for UI
-function Utils.MakeDraggable(topBar, mainFrame)
-    local dragging = false
-    local dragInput = nil
-    local dragStart = nil
-    local startPos = nil
+-- Viewport size helper (Delta mobile / emulator safe)
+function Utils.GetViewport()
+    local size = Vector2.new(1280, 720)
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if camera and camera.ViewportSize then
+            size = camera.ViewportSize
+        end
+    end)
+    if type(size) ~= "table" or size.X <= 0 or size.Y <= 0 then
+        size = Vector2.new(1280, 720)
+    end
+    return size
+end
 
-    local function update(input)
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
-        )
+local function clampNumber(value, minValue, maxValue)
+    if value < minValue then
+        return minValue
+    end
+    if value > maxValue then
+        return maxValue
+    end
+    return value
+end
+
+--[[
+    Mobile & PC Touch/Mouse Dragging for UI (Delta mobile optimized)
+    - Finger (Touch) and mouse (PC / emulator) support.
+    - Never lets the dragged element leave the screen.
+    - Returns a controller:
+        controller.Dragging    -> true while the finger holds the element
+        controller.WasDragged  -> true right after a real drag gesture
+        controller.Destroy()   -> disconnects all listeners
+]]
+function Utils.MakeDraggable(handle, target, keepInsideScreen)
+    if keepInsideScreen == nil then
+        keepInsideScreen = true
     end
 
-    topBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = mainFrame.Position
+    local controller = {
+        Dragging = false,
+        WasDragged = false,
+    }
 
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
+    local dragging = false
+    local moved = false
+    local dragInput = nil
+    local dragStart = nil
+    local startOffset = nil
+    local connections = {}
+
+    local function track(connection)
+        connections[#connections + 1] = connection
+        return connection
+    end
+
+    local function isDragInput(input)
+        return input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+    end
+
+    local function parentOrigin()
+        local parent = target.Parent
+        if parent and parent.AbsolutePosition then
+            return parent.AbsolutePosition
         end
-    end)
+        return Vector2.new(0, 0)
+    end
 
-    topBar.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+    local function applyPosition(absX, absY)
+        local parent = target.Parent
+        local parentSize = nil
+        if parent and parent.AbsoluteSize then
+            parentSize = parent.AbsoluteSize
+        end
+        if not parentSize or parentSize.X <= 0 or parentSize.Y <= 0 then
+            parentSize = Utils.GetViewport()
+        end
+
+        local size = target.AbsoluteSize or Vector2.new(0, 0)
+        if keepInsideScreen then
+            local maxX = parentSize.X - size.X
+            local maxY = parentSize.Y - size.Y
+            if maxX < 0 then
+                maxX = 0
+            end
+            if maxY < 0 then
+                maxY = 0
+            end
+            absX = clampNumber(absX, 0, maxX)
+            absY = clampNumber(absY, 0, maxY)
+        end
+
+        target.Position = UDim2.new(0, math.floor(absX), 0, math.floor(absY))
+    end
+
+    local function beginDrag(input)
+        dragging = true
+        moved = false
+        controller.Dragging = true
+        controller.WasDragged = false
+        dragStart = input.Position
+        startOffset = target.AbsolutePosition - parentOrigin()
+    end
+
+    local function endDrag()
+        dragging = false
+        controller.Dragging = false
+        dragInput = nil
+        controller.WasDragged = moved
+    end
+
+    track(handle.InputBegan:Connect(function(input)
+        if isDragInput(input) then
+            beginDrag(input)
+        end
+    end))
+
+    track(handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
             dragInput = input
         end
-    end)
+    end))
 
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            update(input)
+    track(handle.InputEnded:Connect(function(input)
+        if isDragInput(input) then
+            endDrag()
         end
-    end)
+    end))
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput and dragStart and startOffset then
+            local delta = input.Position - dragStart
+            if math.abs(delta.X) > 3 or math.abs(delta.Y) > 3 then
+                moved = true
+            end
+            applyPosition(startOffset.X + delta.X, startOffset.Y + delta.Y)
+        end
+    end))
+
+    function controller.Destroy()
+        for _, connection in ipairs(connections) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        connections = {}
+        dragging = false
+        controller.Dragging = false
+    end
+
+    return controller
 end
 
 return Utils

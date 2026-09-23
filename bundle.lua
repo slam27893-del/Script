@@ -3,6 +3,7 @@
     🔥 REDZ STYLE BLOX FRUITS FINDER & SERVER HOPPER (DELTA MOBILE) 🔥
     ===================================================================
     - Target Executor: Delta Mobile (Android / iOS) & PC Compatible
+    - Version: 2.0 (Delta Mobile UI Patch)
     - Features:
       * Server Hop Finder (Roblox Public Servers API)
       * Spawned Fruits Detector (All / Rare / Mythical)
@@ -11,15 +12,260 @@
       * Discord Webhook Integration with Rich Embeds & Join Scripts
       * Direct Join Script Generator & Mobile Deep Link
       * Touch-Optimized Redz Hub UI with Draggable Floating Button
+    -------------------------------------------------------------------
+    DELTA MOBILE UI PATCH (v2):
+      * gethui() is used FIRST for the ScreenGui, with an automatic safe
+        fallback chain (gethui -> CoreGui -> PlayerGui) so Android builds
+        that block CoreGui injection never throw errors.
+      * ScreenGui.DisplayOrder = 999999 & IgnoreGuiInset = true so the UI
+        always draws ABOVE the in-game mobile buttons.
+      * Responsive window 440x285 (auto-fit on tiny screens) and a
+        draggable 52x52 floating apple button with ZIndex = 1000.
+      * NO restart lock: re-pressing Execute deletes the old instance
+        (GUI + threads + connections) and boots a brand new one.
     ===================================================================
 ]]
 
--- Prevent multiple script instances running concurrently
-if getgenv and getgenv().DeltaBloxFruitsFinderLoaded then
-    warn("[DeltaBlox] Script is already running!")
-    return
+-----------------------------------------------------------------------
+-- SECTION 0: RE-EXECUTION HANDLING (DELTA MOBILE RESTART SAFE)
+--   There is NO "script already running" lock anymore.
+--   Pressing Execute again:
+--     1) Shuts the previous instance down (threads cancelled, connections
+--        disconnected, old ScreenGui destroyed from every GUI parent).
+--     2) Starts a brand new instance immediately.
+-----------------------------------------------------------------------
+local GLOBAL_SESSION_KEY = "__DeltaBloxFruitsFinderSession"
+local GUI_NAME = "DeltaBloxFruitsFinder"
+
+-- Returns the executor environment table (getgenv() / _G) safely
+local function getExecutorEnv()
+    if type(getgenv) == "function" then
+        local ok, env = pcall(getgenv)
+        if ok and type(env) == "table" then
+            return env
+        end
+    end
+    if type(_G) == "table" then
+        return _G
+    end
+    return {}
 end
-if getgenv then getgenv().DeltaBloxFruitsFinderLoaded = true end
+
+local ENV = getExecutorEnv()
+
+-- True only when the value is a real Roblox Instance
+local function isInstance(value)
+    if value == nil then
+        return false
+    end
+    local ok, name = pcall(function()
+        return value.Name
+    end)
+    return ok and type(name) == "string"
+end
+
+-- Candidate ScreenGui parents ordered by Delta-mobile safety:
+--   1) gethui()  -> executor hidden UI, never protected (best on Android)
+--   2) CoreGui   -> blocked on some Android / Delta builds
+--   3) PlayerGui -> 100% allowed, always works as a safe fallback
+local function getGuiParents()
+    local parents = {}
+    local seen = {}
+
+    local function add(obj)
+        if obj == nil or seen[obj] then
+            return
+        end
+        seen[obj] = true
+        if isInstance(obj) and type(obj.FindFirstChild) == "function" then
+            parents[#parents + 1] = obj
+        end
+    end
+
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok then
+            add(hidden)
+        end
+    end
+
+    local okCore, coreGui = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if okCore then
+        add(coreGui)
+    end
+
+    local okPlayer, playerGui = pcall(function()
+        local localPlayer = game:GetService("Players").LocalPlayer
+        if not localPlayer then
+            return nil
+        end
+        local pg = localPlayer:FindFirstChild("PlayerGui")
+        if not pg then
+            pg = localPlayer:WaitForChild("PlayerGui", 10)
+        end
+        return pg
+    end)
+    if okPlayer then
+        add(playerGui)
+    end
+
+    return parents
+end
+
+-- Destroys every leftover copy of this script's GUI (recursive, all parents)
+local function destroyOldGuis()
+    local removed = 0
+    for _, parent in ipairs(getGuiParents()) do
+        local guard = 0
+        local target = parent:FindFirstChild(GUI_NAME, true)
+        while target and guard < 8 do
+            guard = guard + 1
+            pcall(function()
+                target:Destroy()
+            end)
+            removed = removed + 1
+            target = parent:FindFirstChild(GUI_NAME, true)
+        end
+
+        local floatLeftover = parent:FindFirstChild("DeltaFloatBtn", true)
+        if floatLeftover then
+            pcall(function()
+                floatLeftover:Destroy()
+            end)
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+-- Session object: every thread / connection of this run is registered here
+local Session = {
+    Kind = "bundle",
+    GuiName = GUI_NAME,
+    Alive = true,
+    Cleaned = false,
+    Threads = {},
+    Connections = {},
+    ScreenGui = nil,
+    UI = nil,
+    Hop = nil,
+}
+
+function Session.TrackThread(thread)
+    if thread ~= nil then
+        Session.Threads[#Session.Threads + 1] = thread
+    end
+    return thread
+end
+
+function Session.TrackConnection(connection)
+    if connection ~= nil then
+        Session.Connections[#Session.Connections + 1] = connection
+    end
+    return connection
+end
+
+-- task.spawn replacement that stops itself when the session is dead
+function Session.Spawn(fn, arg1, arg2)
+    local thread = task.spawn(function()
+        if not Session.Alive then
+            return
+        end
+        local ok, err = pcall(fn, arg1, arg2)
+        if not ok then
+            warn("[DeltaBlox] Thread error: " .. tostring(err))
+        end
+    end)
+    return Session.TrackThread(thread)
+end
+
+function Session.Destroy()
+    if Session.Cleaned then
+        return
+    end
+    Session.Cleaned = true
+    Session.Alive = false
+
+    -- 1) stop background loops (auto hop, scans, webhooks...)
+    for _, thread in ipairs(Session.Threads) do
+        pcall(function()
+            if coroutine.status(thread) ~= "dead" then
+                task.cancel(thread)
+            end
+        end)
+    end
+    Session.Threads = {}
+
+    -- 2) disconnect event listeners
+    for _, connection in ipairs(Session.Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    Session.Connections = {}
+
+    -- 3) stop the hopper of the previous run
+    if Session.Hop and type(Session.Hop.StopAutoHop) == "function" then
+        pcall(Session.Hop.StopAutoHop)
+    end
+
+    -- 4) remove the previous user interface
+    if Session.UI and type(Session.UI.Destroy) == "function" then
+        pcall(Session.UI.Destroy, Session.UI)
+    end
+    if Session.ScreenGui then
+        pcall(function()
+            Session.ScreenGui:Destroy()
+        end)
+    end
+    Session.ScreenGui = nil
+
+    destroyOldGuis()
+    print("[DeltaBlox] Previous instance shut down cleanly (re-execution safe).")
+end
+
+-- Shut down the previous instance (bundle OR modular) before booting this one
+local WAS_RESTART = false
+local previousSession = ENV[GLOBAL_SESSION_KEY]
+if type(previousSession) == "table" then
+    WAS_RESTART = true
+    pcall(function()
+        if type(previousSession.Destroy) == "function" then
+            previousSession.Destroy(previousSession)
+        else
+            if type(previousSession.StopAutoHop) == "function" then
+                previousSession.StopAutoHop()
+            end
+            if type(previousSession.Threads) == "table" then
+                for _, thread in ipairs(previousSession.Threads) do
+                    pcall(task.cancel, thread)
+                end
+            end
+            if type(previousSession.Connections) == "table" then
+                for _, connection in ipairs(previousSession.Connections) do
+                    pcall(function()
+                        connection:Disconnect()
+                    end)
+                end
+            end
+            if previousSession.ScreenGui then
+                pcall(function()
+                    previousSession.ScreenGui:Destroy()
+                end)
+            end
+        end
+    end)
+end
+
+-- Always clean leftovers of older versions of this script (older builds had
+-- no session object at all, so their GUI could still be alive)
+destroyOldGuis()
+
+-- Register this brand new session (no lock is ever used)
+ENV[GLOBAL_SESSION_KEY] = Session
+ENV.DeltaBloxFruitsFinderLoaded = true -- kept only as an info flag, never blocks
 
 local HttpService = game:GetService("HttpService")
 local StarterGui = game:GetService("StarterGui")
@@ -29,7 +275,12 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
-local CoreGui = game:GetService("CoreGui")
+
+-- CoreGui is fetched inside a pcall: some Android / Delta builds block it
+local CoreGui = nil
+pcall(function()
+    CoreGui = game:GetService("CoreGui")
+end)
 
 -----------------------------------------------------------------------
 -- SECTION 1: CONSTANTS & DATABASE
@@ -309,47 +560,160 @@ function Utils.GetMobileJoinLink(placeId, jobId)
     return string.format("roblox://experiences/start?placeId=%s&gameInstanceId=%s", tostring(placeId), tostring(jobId))
 end
 
-function Utils.MakeDraggable(topBar, mainFrame)
-    local dragging = false
-    local dragInput = nil
-    local dragStart = nil
-    local startPos = nil
+-- Viewport size helper (mobile / emulator safe)
+function Utils.GetViewport()
+    local size = Vector2.new(1280, 720)
+    pcall(function()
+        local camera = workspace.CurrentCamera
+        if camera and camera.ViewportSize then
+            size = camera.ViewportSize
+        end
+    end)
+    if type(size) ~= "table" or size.X <= 0 or size.Y <= 0 then
+        size = Vector2.new(1280, 720)
+    end
+    return size
+end
 
-    local function update(input)
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
-        )
+local function clampNumber(value, minValue, maxValue)
+    if value < minValue then
+        return minValue
+    end
+    if value > maxValue then
+        return maxValue
+    end
+    return value
+end
+
+--[[
+    Touch + Mouse dragging engine (Delta mobile optimized)
+    - Works with finger (Touch) and mouse on PC / emulator.
+    - Keeps the dragged element fully inside the screen.
+    - Returns a controller:
+        controller.Dragging    -> true while a finger holds the element
+        controller.WasDragged  -> true right after a real drag (used to
+                                  avoid "open/close UI" on a drag gesture)
+        controller.Destroy()   -> disconnects every listener
+]]
+function Utils.MakeDraggable(handle, target, keepInsideScreen)
+    if keepInsideScreen == nil then
+        keepInsideScreen = true
     end
 
-    topBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = mainFrame.Position
+    local controller = {
+        Dragging = false,
+        WasDragged = false,
+    }
 
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
+    local dragging = false
+    local moved = false
+    local dragInput = nil
+    local dragStart = nil
+    local startOffset = nil
+    local connections = {}
+
+    local function track(connection)
+        connections[#connections + 1] = connection
+        return connection
+    end
+
+    local function isDragInput(input)
+        return input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+    end
+
+    local function parentOrigin()
+        local parent = target.Parent
+        if parent and parent.AbsolutePosition then
+            return parent.AbsolutePosition
         end
-    end)
+        return Vector2.new(0, 0)
+    end
 
-    topBar.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+    local function applyPosition(absX, absY)
+        local parent = target.Parent
+        local parentSize = nil
+        if parent and parent.AbsoluteSize then
+            parentSize = parent.AbsoluteSize
+        end
+        if not parentSize or parentSize.X <= 0 or parentSize.Y <= 0 then
+            parentSize = Utils.GetViewport()
+        end
+
+        local size = target.AbsoluteSize or Vector2.new(0, 0)
+        if keepInsideScreen then
+            local maxX = parentSize.X - size.X
+            local maxY = parentSize.Y - size.Y
+            if maxX < 0 then
+                maxX = 0
+            end
+            if maxY < 0 then
+                maxY = 0
+            end
+            absX = clampNumber(absX, 0, maxX)
+            absY = clampNumber(absY, 0, maxY)
+        end
+
+        target.Position = UDim2.new(0, math.floor(absX), 0, math.floor(absY))
+    end
+
+    local function beginDrag(input)
+        dragging = true
+        moved = false
+        controller.Dragging = true
+        controller.WasDragged = false
+        dragStart = input.Position
+        startOffset = target.AbsolutePosition - parentOrigin()
+    end
+
+    local function endDrag()
+        dragging = false
+        controller.Dragging = false
+        dragInput = nil
+        controller.WasDragged = moved
+    end
+
+    track(handle.InputBegan:Connect(function(input)
+        if isDragInput(input) then
+            beginDrag(input)
+        end
+    end))
+
+    track(handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
             dragInput = input
         end
-    end)
+    end))
 
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            update(input)
+    track(handle.InputEnded:Connect(function(input)
+        if isDragInput(input) then
+            endDrag()
         end
-    end)
+    end))
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput and dragStart and startOffset then
+            local delta = input.Position - dragStart
+            if math.abs(delta.X) > 3 or math.abs(delta.Y) > 3 then
+                moved = true
+            end
+            applyPosition(startOffset.X + delta.X, startOffset.Y + delta.Y)
+        end
+    end))
+
+    function controller.Destroy()
+        for _, connection in ipairs(connections) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+        connections = {}
+        dragging = false
+        controller.Dragging = false
+    end
+
+    return controller
 end
 
 -----------------------------------------------------------------------
@@ -925,8 +1289,8 @@ function Hop.StartAutoHop(placeId, scanCallback)
     isHoppingActive = true
     loadHistory()
 
-    currentHopThread = task.spawn(function()
-        while isHoppingActive do
+    currentHopThread = Session.Spawn(function()
+        while isHoppingActive and Session.Alive do
             local scanResult = scanCallback and scanCallback()
             if scanResult and scanResult.HasTarget and Config.AutoStayOnFind then
                 isHoppingActive = false
@@ -937,11 +1301,11 @@ function Hop.StartAutoHop(placeId, scanCallback)
 
             local delayTime = Config.HopDelay or 5
             for i = delayTime, 1, -1 do
-                if not isHoppingActive then break end
+                if not isHoppingActive or not Session.Alive then break end
                 task.wait(1)
             end
 
-            if not isHoppingActive then break end
+            if not isHoppingActive or not Session.Alive then break end
 
             local ok = Hop.HopOnce(placeId)
             if not ok then
@@ -956,7 +1320,7 @@ end
 function Hop.StopAutoHop()
     isHoppingActive = false
     if currentHopThread then
-        task.cancel(currentHopThread)
+        pcall(task.cancel, currentHopThread)
         currentHopThread = nil
     end
 end
@@ -965,34 +1329,89 @@ function Hop.IsHopping()
     return isHoppingActive
 end
 
-TeleportService.TeleportInitFailed:Connect(function(player, result, msg)
-    if isHoppingActive then
+-- Registered so a re-execution can stop the old hopper immediately
+Session.Hop = Hop
+
+Session.TrackConnection(TeleportService.TeleportInitFailed:Connect(function(player, result, msg)
+    if isHoppingActive and Session.Alive then
         task.wait(2)
         Hop.HopOnce(game.PlaceId)
     end
-end)
+end))
 
 -----------------------------------------------------------------------
--- SECTION 7: USER INTERFACE (REDZ HUB STYLE)
+-- SECTION 7: USER INTERFACE (REDZ HUB STYLE - DELTA MOBILE PATCH v2)
 -----------------------------------------------------------------------
 local UI = {}
 
-local function getGuiParent()
-    local success, target = pcall(function() return CoreGui end)
-    if success and target then return target end
-    return Players.LocalPlayer:WaitForChild("PlayerGui")
+--[[
+    Parents the ScreenGui using the safest Delta-mobile chain:
+        1) gethui()                      (executor hidden UI - first choice)
+        2) CoreGui                       (often blocked on Android)
+        3) Players.LocalPlayer.PlayerGui (always allowed fallback)
+    Silent failures are detected too: if the Parent does not stick we move
+    to the next candidate instead of leaving an invisible GUI behind.
+]]
+local function parentScreenGui(gui)
+    for _, candidate in ipairs(getGuiParents()) do
+        local ok = pcall(function()
+            gui.Parent = candidate
+        end)
+        if ok and gui.Parent == candidate then
+            return candidate
+        end
+    end
+
+    -- Last resort: straight into PlayerGui (never blocked by Roblox)
+    local ok = pcall(function()
+        local localPlayer = game:GetService("Players").LocalPlayer
+        local playerGui = localPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then
+            playerGui = localPlayer:WaitForChild("PlayerGui", 10)
+        end
+        gui.Parent = playerGui
+    end)
+    if ok and gui.Parent then
+        return gui.Parent
+    end
+    return nil
 end
 
 function UI.Create()
-    local parent = getGuiParent()
-    local oldGui = parent:FindFirstChild("DeltaBloxFruitsFinder")
-    if oldGui then oldGui:Destroy() end
-
+    -- 1) ScreenGui (Delta mobile safe injection) ---------------------
     local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "DeltaBloxFruitsFinder"
-    ScreenGui.ResetOnSpawn = false
+    ScreenGui.Name = GUI_NAME
+    ScreenGui.ResetOnSpawn = false          -- survives respawn / death
     ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ScreenGui.Parent = parent
+    ScreenGui.DisplayOrder = 999999         -- above game buttons & other hubs
+    ScreenGui.IgnoreGuiInset = true         -- draw over the mobile top inset
+    ScreenGui.Enabled = true
+
+    -- Optional properties: safe-set because old engines may not support them
+    pcall(function() ScreenGui.ClipToDeviceSafeArea = false end)
+    pcall(function() ScreenGui.OnTopOfCoreBlur = true end)
+
+    local chosenParent = parentScreenGui(ScreenGui)
+    if not chosenParent then
+        warn("[DeltaBlox UI] Could not parent the ScreenGui in any GUI container!")
+        return nil
+    end
+    Session.ScreenGui = ScreenGui
+
+    -- 2) Responsive mobile window size (base 440x285) -----------------
+    local viewport = Utils.GetViewport()
+    local BASE_W, BASE_H = 440, 285
+    local fitScale = 1
+    if viewport.X > 40 and viewport.Y > 40 then
+        fitScale = math.min(1, (viewport.X - 16) / BASE_W, (viewport.Y - 16) / BASE_H)
+    end
+    if fitScale < 0.7 then
+        fitScale = 0.7 -- never shrink below readability on tiny screens
+    end
+    local WIN_W = math.floor(BASE_W * fitScale)
+    local WIN_H = math.floor(BASE_H * fitScale)
+    local startX = math.max(8, math.floor((viewport.X - WIN_W) / 2))
+    local startY = math.max(8, math.floor((viewport.Y - WIN_H) / 2))
 
     local C_BG = Color3.fromRGB(17, 18, 24)
     local C_TOPBAR = Color3.fromRGB(23, 24, 32)
@@ -1003,16 +1422,19 @@ function UI.Create()
     local C_GREEN = Color3.fromRGB(46, 204, 113)
     local C_GRAY = Color3.fromRGB(60, 65, 80)
 
-    -- Floating Mobile Toggle Icon
+    -- 3) Floating apple button: 52x52, ZIndex 1000, touch draggable ----
     local FloatButton = Instance.new("ImageButton")
     FloatButton.Name = "DeltaFloatBtn"
-    FloatButton.Size = UDim2.new(0, 50, 0, 50)
-    FloatButton.Position = UDim2.new(0, 15, 0.4, 0)
+    FloatButton.Size = UDim2.new(0, 52, 0, 52)
+    FloatButton.Position = UDim2.new(0, 15, 0.35, 0)
     FloatButton.BackgroundColor3 = C_BG
     FloatButton.BorderSizePixel = 0
     FloatButton.AutoButtonColor = false
+    FloatButton.Active = true
+    FloatButton.ZIndex = 1000
     FloatButton.Parent = ScreenGui
-    Instance.new("UICorner", FloatButton).CornerRadius = UDim.new(0, 25)
+
+    Instance.new("UICorner", FloatButton).CornerRadius = UDim.new(0, 26)
 
     local FloatStroke = Instance.new("UIStroke")
     FloatStroke.Color = C_ACCENT
@@ -1020,23 +1442,29 @@ function UI.Create()
     FloatStroke.Parent = FloatButton
 
     local FloatIcon = Instance.new("TextLabel")
+    FloatIcon.Name = "Icon"
     FloatIcon.Size = UDim2.new(1, 0, 1, 0)
     FloatIcon.BackgroundTransparency = 1
+    FloatIcon.Font = Enum.Font.GothamBold
     FloatIcon.Text = "🍎"
-    FloatIcon.TextSize = 24
+    FloatIcon.TextSize = 26
+    FloatIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FloatIcon.ZIndex = 1001
     FloatIcon.Parent = FloatButton
 
-    Utils.MakeDraggable(FloatButton, FloatButton)
+    local floatDrag = Utils.MakeDraggable(FloatButton, FloatButton, true)
 
-    -- Main Window Frame
+    -- 4) Main window: 440x285, draggable by its top bar -----------------
     local MainFrame = Instance.new("Frame")
     MainFrame.Name = "MainFrame"
-    MainFrame.Size = UDim2.new(0, 480, 0, 310)
-    MainFrame.Position = UDim2.new(0.5, -240, 0.5, -155)
+    MainFrame.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+    MainFrame.Position = UDim2.new(0, startX, 0, startY)
     MainFrame.BackgroundColor3 = C_BG
     MainFrame.BorderSizePixel = 0
     MainFrame.ClipsDescendants = true
     MainFrame.Visible = true
+    MainFrame.Active = true
+    MainFrame.ZIndex = 900
     MainFrame.Parent = ScreenGui
     Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
 
@@ -1051,10 +1479,11 @@ function UI.Create()
     TopBar.Size = UDim2.new(1, 0, 0, 38)
     TopBar.BackgroundColor3 = C_TOPBAR
     TopBar.BorderSizePixel = 0
+    TopBar.Active = true -- required to catch touch input on mobile
     TopBar.Parent = MainFrame
     Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
 
-    Utils.MakeDraggable(TopBar, MainFrame)
+    local mainDrag = Utils.MakeDraggable(TopBar, MainFrame, true)
 
     local Title = Instance.new("TextLabel")
     Title.Size = UDim2.new(0.7, 0, 1, 0)
@@ -1086,8 +1515,19 @@ function UI.Create()
     CloseBtn.Parent = TopBar
     Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
 
-    CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible = false end)
-    FloatButton.MouseButton1Click:Connect(function() MainFrame.Visible = not MainFrame.Visible end)
+    CloseBtn.MouseButton1Click:Connect(function()
+        MainFrame.Visible = false
+        Utils.Notify("Delta Blox Fruits", "تم إخفاء الواجهة، اضغط على أيقونة 🍎 لإرجاعها.", 3)
+    end)
+
+    FloatButton.MouseButton1Click:Connect(function()
+        -- A finger drag must never toggle the window by accident
+        if floatDrag.WasDragged then
+            floatDrag.WasDragged = false
+            return
+        end
+        MainFrame.Visible = not MainFrame.Visible
+    end)
 
     -- Status Bar
     local InfoBar = Instance.new("Frame")
@@ -1110,9 +1550,14 @@ function UI.Create()
     InfoText.TextXAlignment = Enum.TextXAlignment.Left
     InfoText.Parent = InfoBar
 
-    -- Tabs Sidebar
+    -- Tabs Sidebar (proportional so the window stays responsive on phones)
+    local SIDEBAR_W = math.floor(WIN_W * 0.27)
+    if SIDEBAR_W < 96 then
+        SIDEBAR_W = 96
+    end
+
     local TabContainer = Instance.new("Frame")
-    TabContainer.Size = UDim2.new(0, 120, 1, -74)
+    TabContainer.Size = UDim2.new(0, SIDEBAR_W, 1, -74)
     TabContainer.Position = UDim2.new(0, 10, 0, 70)
     TabContainer.BackgroundColor3 = C_TOPBAR
     TabContainer.BorderSizePixel = 0
@@ -1120,8 +1565,8 @@ function UI.Create()
     Instance.new("UICorner", TabContainer).CornerRadius = UDim.new(0, 6)
 
     local ContentContainer = Instance.new("Frame")
-    ContentContainer.Size = UDim2.new(1, -145, 1, -74)
-    ContentContainer.Position = UDim2.new(0, 135, 0, 70)
+    ContentContainer.Size = UDim2.new(1, -(SIDEBAR_W + 25), 1, -74)
+    ContentContainer.Position = UDim2.new(0, SIDEBAR_W + 15, 0, 70)
     ContentContainer.BackgroundTransparency = 1
     ContentContainer.Parent = MainFrame
 
@@ -1405,10 +1850,19 @@ function UI.Create()
     helpLabel.Parent = helpCard
 
     -- TAB 4: LIVE SCAN RESULTS
+    local scanNowBtn = createButton(tabLive, "🔄 فحص السيرفر الحالي الآن", C_ACCENT, function()
+        Utils.Notify("جاري الفحص...", "يتم فحص محتويات السيرفر الآن...", 2)
+        local res = Detector.ScanAll()
+        UI.HandleScanResults(res)
+        UI.RenderLiveResults(tabLive, res)
+    end)
+    scanNowBtn.LayoutOrder = 1
+
     local resultsContainer = Instance.new("Frame")
     resultsContainer.Name = "ResultsContainer"
     resultsContainer.Size = UDim2.new(1, 0, 0, 160)
     resultsContainer.BackgroundTransparency = 1
+    resultsContainer.LayoutOrder = 2
     resultsContainer.Parent = tabLive
 
     local resLayout = Instance.new("UIListLayout")
@@ -1416,18 +1870,39 @@ function UI.Create()
     resLayout.Padding = UDim.new(0, 6)
     resLayout.Parent = resultsContainer
 
-    createButton(tabLive, "🔄 فحص السيرفر الحالي الآن", C_ACCENT, function()
-        Utils.Notify("جاري الفحص...", "يتم فحص محتويات السيرفر الآن...", 2)
-        local res = Detector.ScanAll()
-        UI.HandleScanResults(res)
-        UI.RenderLiveResults(tabLive, res)
-    end)
-
     switchTab("Hopper")
-    return { TabLive = tabLive }
+
+    -- 5) UI instance handle: used by the re-execution cleanup -----------
+    local dragControllers = { floatDrag, mainDrag }
+
+    local uiInstance = {
+        ScreenGui = ScreenGui,
+        MainFrame = MainFrame,
+        ResultsContainer = resultsContainer,
+        TabLive = tabLive,
+        ParentContainer = chosenParent,
+        DragControllers = dragControllers,
+    }
+
+    function uiInstance.Destroy()
+        for _, controller in ipairs(dragControllers) do
+            pcall(function()
+                controller.Destroy()
+            end)
+        end
+        dragControllers = {}
+        if ScreenGui then
+            pcall(function()
+                ScreenGui:Destroy()
+            end)
+        end
+    end
+
+    return uiInstance
 end
 
 function UI.RenderLiveResults(tabLive, scanResult)
+    if not tabLive or not scanResult then return end
     local container = tabLive:FindFirstChild("ResultsContainer")
     if not container then return end
 
@@ -1650,17 +2125,29 @@ end
 -----------------------------------------------------------------------
 local function Init()
     Utils.Notify("Delta Blox Fruits", "جاري تهيئة واجهة Redz Hub...", 3)
+
     local uiInstance = UI.Create()
+    if not uiInstance then
+        warn("[DeltaBlox] UI failed to initialize. Aborting startup.")
+        return
+    end
+    Session.UI = uiInstance
 
     -- Initial scan on server join
-    task.spawn(function()
+    Session.Spawn(function()
         task.wait(2)
+        if not Session.Alive then return end
         local initialScan = Detector.ScanAll()
         UI.HandleScanResults(initialScan)
-        if uiInstance and uiInstance.TabLive then
+        if uiInstance.TabLive then
             UI.RenderLiveResults(uiInstance.TabLive, initialScan)
         end
     end)
+
+    if WAS_RESTART then
+        Utils.Notify("تم إعادة التشغيل ✅", "تم حذف النسخة القديمة وتشغيل نسخة جديدة بنجاح.", 4)
+        print("[DeltaBlox] Re-executed: old instance removed, new instance running.")
+    end
 
     print("[DeltaBlox] Redz Hub Fruit & Boss Finder initialized successfully!")
 end

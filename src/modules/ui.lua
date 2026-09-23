@@ -1,39 +1,165 @@
 --[[
     Blox Fruits UI Module - Redz Hub & Quantum Hub Style
-    Mobile-touch optimized, draggable floating button, smooth tabs and toggles.
+    Delta Mobile patch v2:
+      * gethui() -> CoreGui -> PlayerGui safe parenting chain
+      * DisplayOrder = 999999 and IgnoreGuiInset = true
+      * Responsive 440x285 window + 52x52 draggable floating apple (ZIndex 1000)
+      * Re-execution safe: the old GUI is destroyed and a new one is built
 ]]
 
-local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
 
 local UI = {}
 
--- Safe ScreenGui parent (CoreGui or PlayerGui)
-local function getGuiParent()
-    local success, target = pcall(function()
-        return CoreGui
-    end)
-    if success and target then
-        return target
+-- CoreGui is fetched inside a pcall: some Android / Delta builds block it
+local CoreGui = nil
+pcall(function()
+    CoreGui = game:GetService("CoreGui")
+end)
+
+local GUI_NAME = "DeltaBloxFruitsFinder"
+
+-- True only when the value is a real Roblox Instance
+local function isInstance(value)
+    if value == nil then
+        return false
     end
-    return Players.LocalPlayer:WaitForChild("PlayerGui")
+    local ok, name = pcall(function()
+        return value.Name
+    end)
+    return ok and type(name) == "string"
+end
+
+--[[
+    Candidate ScreenGui parents ordered by Delta-mobile safety:
+        1) gethui()                       -> executor hidden UI (first choice)
+        2) CoreGui                        -> blocked on some Android builds
+        3) Players.LocalPlayer.PlayerGui  -> always allowed safe fallback
+]]
+function UI.GetGuiParents()
+    local parents = {}
+    local seen = {}
+
+    local function add(obj)
+        if obj == nil or seen[obj] then
+            return
+        end
+        seen[obj] = true
+        if isInstance(obj) and type(obj.FindFirstChild) == "function" then
+            parents[#parents + 1] = obj
+        end
+    end
+
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok then
+            add(hidden)
+        end
+    end
+
+    add(CoreGui)
+
+    local okPlayer, playerGui = pcall(function()
+        local localPlayer = Players.LocalPlayer
+        if not localPlayer then
+            return nil
+        end
+        local pg = localPlayer:FindFirstChild("PlayerGui")
+        if not pg then
+            pg = localPlayer:WaitForChild("PlayerGui", 10)
+        end
+        return pg
+    end)
+    if okPlayer then
+        add(playerGui)
+    end
+
+    return parents
+end
+
+-- Parents the ScreenGui to the first container that accepts it
+function UI.ParentScreenGui(gui)
+    for _, candidate in ipairs(UI.GetGuiParents()) do
+        local ok = pcall(function()
+            gui.Parent = candidate
+        end)
+        if ok and gui.Parent == candidate then
+            return candidate
+        end
+    end
+
+    -- Last resort: straight into PlayerGui (never blocked by Roblox)
+    local ok = pcall(function()
+        local localPlayer = Players.LocalPlayer
+        local playerGui = localPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then
+            playerGui = localPlayer:WaitForChild("PlayerGui", 10)
+        end
+        gui.Parent = playerGui
+    end)
+    if ok and gui.Parent then
+        return gui.Parent
+    end
+    return nil
+end
+
+-- Destroys every leftover copy of this GUI (recursive, all GUI parents)
+function UI.DestroyOldGuis()
+    for _, parent in ipairs(UI.GetGuiParents()) do
+        local guard = 0
+        local target = parent:FindFirstChild(GUI_NAME, true)
+        while target and guard < 8 do
+            guard = guard + 1
+            pcall(function()
+                target:Destroy()
+            end)
+            target = parent:FindFirstChild(GUI_NAME, true)
+        end
+
+        local floatLeftover = parent:FindFirstChild("DeltaFloatBtn", true)
+        if floatLeftover then
+            pcall(function()
+                floatLeftover:Destroy()
+            end)
+        end
+    end
 end
 
 function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
-    local parent = getGuiParent()
-
-    -- Remove previous instance if re-executing
-    local oldGui = parent:FindFirstChild("DeltaBloxFruitsFinder")
-    if oldGui then
-        oldGui:Destroy()
-    end
+    -- Remove every previous instance before building the new UI
+    UI.DestroyOldGuis()
 
     local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "DeltaBloxFruitsFinder"
-    ScreenGui.ResetOnSpawn = false
+    ScreenGui.Name = GUI_NAME
+    ScreenGui.ResetOnSpawn = false          -- survives respawn / death
     ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ScreenGui.Parent = parent
+    ScreenGui.DisplayOrder = 999999         -- above game buttons & other hubs
+    ScreenGui.IgnoreGuiInset = true         -- draw over the mobile top inset
+    ScreenGui.Enabled = true
+
+    pcall(function() ScreenGui.ClipToDeviceSafeArea = false end)
+    pcall(function() ScreenGui.OnTopOfCoreBlur = true end)
+
+    local parent = UI.ParentScreenGui(ScreenGui)
+    if not parent then
+        warn("[DeltaBlox UI] Could not parent the ScreenGui in any GUI container!")
+        return nil
+    end
+
+    -- Responsive mobile window size (base 440x285)
+    local viewport = Utils.GetViewport()
+    local BASE_W, BASE_H = 440, 285
+    local fitScale = 1
+    if viewport.X > 40 and viewport.Y > 40 then
+        fitScale = math.min(1, (viewport.X - 16) / BASE_W, (viewport.Y - 16) / BASE_H)
+    end
+    if fitScale < 0.7 then
+        fitScale = 0.7
+    end
+    local WIN_W = math.floor(BASE_W * fitScale)
+    local WIN_H = math.floor(BASE_H * fitScale)
+    local startX = math.max(8, math.floor((viewport.X - WIN_W) / 2))
+    local startY = math.max(8, math.floor((viewport.Y - WIN_H) / 2))
 
     -- Color Palette (Redz Hub Dark & Neon Crimson)
     local C_BG = Color3.fromRGB(17, 18, 24)
@@ -46,18 +172,20 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
     local C_GREEN = Color3.fromRGB(46, 204, 113)
     local C_GRAY = Color3.fromRGB(60, 65, 80)
 
-    -- 1. Floating Mobile Toggle Icon (Always visible & draggable)
+    -- 1. Floating Mobile Toggle Icon: 52x52, ZIndex 1000, touch draggable
     local FloatButton = Instance.new("ImageButton")
     FloatButton.Name = "DeltaFloatBtn"
-    FloatButton.Size = UDim2.new(0, 50, 0, 50)
-    FloatButton.Position = UDim2.new(0, 15, 0.4, 0)
+    FloatButton.Size = UDim2.new(0, 52, 0, 52)
+    FloatButton.Position = UDim2.new(0, 15, 0.35, 0)
     FloatButton.BackgroundColor3 = C_BG
     FloatButton.BorderSizePixel = 0
     FloatButton.AutoButtonColor = false
+    FloatButton.Active = true
+    FloatButton.ZIndex = 1000
     FloatButton.Parent = ScreenGui
 
     local FloatCorner = Instance.new("UICorner")
-    FloatCorner.CornerRadius = UDim.new(0, 25)
+    FloatCorner.CornerRadius = UDim.new(0, 26)
     FloatCorner.Parent = FloatButton
 
     local FloatStroke = Instance.new("UIStroke")
@@ -66,23 +194,29 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
     FloatStroke.Parent = FloatButton
 
     local FloatIcon = Instance.new("TextLabel")
+    FloatIcon.Name = "Icon"
     FloatIcon.Size = UDim2.new(1, 0, 1, 0)
     FloatIcon.BackgroundTransparency = 1
+    FloatIcon.Font = Enum.Font.GothamBold
     FloatIcon.Text = "🍎"
-    FloatIcon.TextSize = 24
+    FloatIcon.TextSize = 26
+    FloatIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FloatIcon.ZIndex = 1001
     FloatIcon.Parent = FloatButton
 
-    Utils.MakeDraggable(FloatButton, FloatButton)
+    local floatDrag = Utils.MakeDraggable(FloatButton, FloatButton, true)
 
-    -- 2. Main Window Frame
+    -- 2. Main Window Frame (440x285, draggable by its top bar)
     local MainFrame = Instance.new("Frame")
     MainFrame.Name = "MainFrame"
-    MainFrame.Size = UDim2.new(0, 480, 0, 310)
-    MainFrame.Position = UDim2.new(0.5, -240, 0.5, -155)
+    MainFrame.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+    MainFrame.Position = UDim2.new(0, startX, 0, startY)
     MainFrame.BackgroundColor3 = C_BG
     MainFrame.BorderSizePixel = 0
     MainFrame.ClipsDescendants = true
     MainFrame.Visible = true
+    MainFrame.Active = true
+    MainFrame.ZIndex = 900
     MainFrame.Parent = ScreenGui
 
     local MainCorner = Instance.new("UICorner")
@@ -100,13 +234,14 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
     TopBar.Size = UDim2.new(1, 0, 0, 38)
     TopBar.BackgroundColor3 = C_TOPBAR
     TopBar.BorderSizePixel = 0
+    TopBar.Active = true -- required to catch touch input on mobile
     TopBar.Parent = MainFrame
 
     local TopBarCorner = Instance.new("UICorner")
     TopBarCorner.CornerRadius = UDim.new(0, 10)
     TopBarCorner.Parent = TopBar
 
-    Utils.MakeDraggable(TopBar, MainFrame)
+    local mainDrag = Utils.MakeDraggable(TopBar, MainFrame, true)
 
     local Title = Instance.new("TextLabel")
     Title.Size = UDim2.new(0.7, 0, 1, 0)
@@ -141,9 +276,15 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
 
     CloseBtn.MouseButton1Click:Connect(function()
         MainFrame.Visible = false
+        Utils.Notify("Delta Blox Fruits", "تم إخفاء الواجهة، اضغط على أيقونة 🍎 لإرجاعها.", 3)
     end)
 
     FloatButton.MouseButton1Click:Connect(function()
+        -- A finger drag must never toggle the window by accident
+        if floatDrag.WasDragged then
+            floatDrag.WasDragged = false
+            return
+        end
         MainFrame.Visible = not MainFrame.Visible
     end)
 
@@ -169,9 +310,14 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
     InfoText.TextXAlignment = Enum.TextXAlignment.Left
     InfoText.Parent = InfoBar
 
-    -- Sidebar / Tab Selection (Left side)
+    -- Sidebar / Tab Selection (Left side, proportional for small phones)
+    local SIDEBAR_W = math.floor(WIN_W * 0.27)
+    if SIDEBAR_W < 96 then
+        SIDEBAR_W = 96
+    end
+
     local TabContainer = Instance.new("Frame")
-    TabContainer.Size = UDim2.new(0, 120, 1, -74)
+    TabContainer.Size = UDim2.new(0, SIDEBAR_W, 1, -74)
     TabContainer.Position = UDim2.new(0, 10, 0, 70)
     TabContainer.BackgroundColor3 = C_TOPBAR
     TabContainer.BorderSizePixel = 0
@@ -180,8 +326,8 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
 
     -- Content Area (Right side)
     local ContentContainer = Instance.new("Frame")
-    ContentContainer.Size = UDim2.new(1, -145, 1, -74)
-    ContentContainer.Position = UDim2.new(0, 135, 0, 70)
+    ContentContainer.Size = UDim2.new(1, -(SIDEBAR_W + 25), 1, -74)
+    ContentContainer.Position = UDim2.new(0, SIDEBAR_W + 15, 0, 70)
     ContentContainer.BackgroundTransparency = 1
     ContentContainer.Parent = MainFrame
 
@@ -508,18 +654,39 @@ function UI.Create(Config, Constants, Utils, Detector, Hop, Notifier)
     -- Initial Tab View
     switchTab("Hopper")
 
-    -- Return control table
-    return {
+    -- Return control table (Destroy() is used by the re-execution cleanup)
+    local dragControllers = { floatDrag, mainDrag }
+
+    local uiInstance = {
         ScreenGui = ScreenGui,
         MainFrame = MainFrame,
         ResultsContainer = resultsContainer,
         TabLive = tabLive,
         SetHopToggleUI = setHopToggleUI,
+        ParentContainer = parent,
+        DragControllers = dragControllers,
     }
+
+    function uiInstance.Destroy()
+        for _, controller in ipairs(dragControllers) do
+            pcall(function()
+                controller.Destroy()
+            end)
+        end
+        dragControllers = {}
+        if ScreenGui then
+            pcall(function()
+                ScreenGui:Destroy()
+            end)
+        end
+    end
+
+    return uiInstance
 end
 
 -- Render Live Scan Results in Tab 4
 function UI.RenderLiveResults(tabLive, scanResult, Config, Constants, Utils)
+    if not tabLive or not scanResult then return end
     local container = tabLive:FindFirstChild("ResultsContainer")
     if not container then return end
 
